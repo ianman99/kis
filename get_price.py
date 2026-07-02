@@ -6,6 +6,10 @@ price.csv 로 저장한다.
 - 조회 범위: 거래 분봉 '개수' 기준. t 시점 봉 ~ t 이후 1000개 봉
   (t 시점 봉 포함). 장 운영시간(09:00~15:30)의 분봉만 카운트하며,
   야간/휴장 갭은 건너뛰고 다음 거래일로 이어서 센다.
+- '정상 공시' = t봉 포함 정확히 1001봉이 모두 정규장(09:00~15:30)에
+  들어온 경우만 인정한다. 조건 미달 공시(t봉 없음 / 봉 수 부족 /
+  시간외 봉 혼입)는 price.csv 에 담지 않고 report_final.csv 에서도
+  삭제(덮어쓰기)한다.
 - 결과 컬럼: stock_code, datetime, open, high, low, close, volume
 """
 
@@ -193,7 +197,11 @@ def main():
     report["datetime"] = pd.to_datetime(report["datetime"])
 
     call_log: list[float] = []
-    frames: list[pd.DataFrame] = []
+    frames:   list[pd.DataFrame] = []
+    keep_idx: list = []                    # 정상 공시로 판정해 유지할 report 행
+    dropped:  list[tuple] = []             # 제외한 (종목, t, 사유)
+
+    expected = 1 + BARS_AFTER              # 정상 봉 개수: t봉 1 + 이후 1000
 
     for i, row in report.iterrows():
         stock_code = row["stock_code"]
@@ -204,13 +212,36 @@ def main():
 
         bars = collect_bars(stock_code, t, call_log)
         df = build_df(stock_code, bars, t)
+
+        # 정상 공시 판정: ① t봉 존재 ② 정확히 1001봉 ③ 전부 정규장(09:00~15:30).
+        # 하나라도 어긋나면 price / report_final 양쪽에서 제외한다.
+        if t not in bars:
+            reason = "t봉 없음"
+        elif len(df) != expected:
+            reason = f"{len(df)}봉(≠{expected})"
+        elif not df["datetime"].dt.strftime("%H%M%S").between(MARKET_OPEN, MARKET_CLOSE).all():
+            reason = "시간외 봉 포함"
+        else:
+            reason = None
+
+        if reason:
+            dropped.append((stock_code, t, reason))
+            print(f"제외 ({reason})")
+            continue
+
         frames.append(df)
+        keep_idx.append(i)
         print(f"{len(df)}건")
 
-    result = pd.concat(frames, ignore_index=True)
+    # 정상 공시만 price.csv 로 저장하고, 제외분을 뺀 report_final.csv 로 덮어쓴다.
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=EMPTY_COLS)
     result.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
+    report.loc[keep_idx].to_csv(REPORT_PATH, index=False, encoding="utf-8-sig")
 
     print(f"\n총 {len(result)}건 → {OUT_PATH}")
+    print(f"공시 {len(report)}건 중 유지 {len(keep_idx)}건 / 제외 {len(dropped)}건 → {REPORT_PATH}")
+    for code, t, reason in dropped:
+        print(f"  제외: {code} t={t} ({reason})")
     if not result.empty:
         print(result.head(10).to_string())
 
